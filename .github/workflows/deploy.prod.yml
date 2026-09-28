@@ -1,0 +1,93 @@
+name: Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brookvinehotelprices-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build -- --webpack
+
+      - name: Package standalone server
+        run: |
+          set -eu
+          test -f .next/standalone/server.js
+          mkdir -p release/.next
+          cp -a .next/standalone/. release/
+          cp -a .next/static release/.next/static
+          cp -a public release/public
+          cp ecosystem.config.cjs release/ecosystem.config.cjs
+          tar -czf brookvinehotelprices.tar.gz -C release .
+
+      - name: Upload release
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: brookvinehotelprices.tar.gz
+          target: /tmp/brookvinehotelprices-${{ github.sha }}
+
+      - name: Activate release
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -eu
+            APP_DIR=/var/www/brookvinehotelprices
+            RELEASE="$APP_DIR/releases/${{ github.sha }}"
+            ARCHIVE=/tmp/brookvinehotelprices-${{ github.sha }}/brookvinehotelprices.tar.gz
+
+            export NVM_DIR="$HOME/.nvm"
+            if [ -s "$NVM_DIR/nvm.sh" ]; then
+              . "$NVM_DIR/nvm.sh"
+              nvm use 24
+            fi
+            command -v node
+            command -v pm2
+
+            mkdir -p "$APP_DIR/releases" "$RELEASE"
+            tar -xzf "$ARCHIVE" -C "$RELEASE"
+            test -f "$RELEASE/server.js"
+            PREVIOUS=$(readlink "$APP_DIR/current" || true)
+            ln -sfn "$RELEASE" "$APP_DIR/current.next"
+            mv -Tf "$APP_DIR/current.next" "$APP_DIR/current"
+
+            if pm2 startOrReload "$APP_DIR/current/ecosystem.config.cjs" --update-env; then
+              pm2 save
+              rm -f "$ARCHIVE"
+              rmdir "$(dirname "$ARCHIVE")"
+            else
+              if [ -n "$PREVIOUS" ]; then
+                ln -sfn "$PREVIOUS" "$APP_DIR/current.next"
+                mv -Tf "$APP_DIR/current.next" "$APP_DIR/current"
+                pm2 startOrReload "$APP_DIR/current/ecosystem.config.cjs" --update-env
+              fi
+              exit 1
+            fi
